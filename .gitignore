@@ -1,0 +1,17 @@
+# Thư mục cache (quan trọng nhất)
+.cache/
+
+# Các tệp do Python tự tạo
+__pycache__/
+*.pyc
+
+# Các tệp tạm/đầu ra trong thư mục 'source'
+source/original_audio.wav
+source/original_transcript.json
+
+# Tệp hệ thống của Mac
+.DS_Store
+
+
+
+

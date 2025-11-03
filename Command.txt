@@ -1,0 +1,9 @@
+docker build -t ai-dubbing .
+
+
+docker run -it --rm \
+  -v "$(pwd)/main.py:/app/main.py" \
+  -v "$(pwd)/source:/app/source" \
+  -v "$(pwd)/.cache/whisper:/root/.cache/whisper" \
+  ai-dubbing \
+  python main.py
