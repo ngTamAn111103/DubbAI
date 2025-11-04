@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir \
     openai-whisper \
     transformers \
     sentencepiece \
-    piper-tts \
+    sacremoses \
     pydub
 
 # (Tùy chọn) Tải trước các mô hình để Docker image chứa sẵn
