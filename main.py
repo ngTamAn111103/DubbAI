@@ -3,6 +3,7 @@ import sys
 import os
 import torch
 import whisper
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 import json
 
 # ---- Cấu hình đường dẫn ----
@@ -22,15 +23,31 @@ AUDIO_OUTPUT_NAME = "original_audio.wav"
 VIDEO_INPUT_PATH = os.path.join(SOURCE_FOLDER, VIDEO_INPUT_NAME)
 AUDIO_OUTPUT_PATH = os.path.join(SOURCE_FOLDER, AUDIO_OUTPUT_NAME)
 
-# MỚI: Tệp JSON chứa kết quả phiên âm
+# Tệp JSON chứa kết quả phiên âm
 TRANSCRIPT_OUTPUT_NAME = "original_transcript.json"
 TRANSCRIPT_OUTPUT_PATH = os.path.join(SOURCE_FOLDER, TRANSCRIPT_OUTPUT_NAME)
+# Tệp JSON dịch thuật Anh -> Việt
+TRANSLATED_TRANSCRIPT_NAME = "translated_transcript.json"
+TRANSLATED_TRANSCRIPT_PATH = os.path.join(SOURCE_FOLDER, TRANSLATED_TRANSCRIPT_NAME)
 
 # Cấu hình mô hình
 WHISPER_MODEL_NAME = "base"
+# Mô hình dịch thuật
+TRANSLATION_MODEL_NAME = "Helsinki-NLP/opus-mt-en-vi"
 # ----------------------------------------
 
-
+def get_device() -> str:
+    """Kiểm tra và trả về thiết bị (device) phù hợp cho PyTorch."""
+    if torch.cuda.is_available():
+        print("Phát hiện GPU CUDA. Đang sử dụng 'cuda'.")
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        print("Phát hiện Apple Silicon (M-series). Đang sử dụng 'mps'.")
+        return "mps"
+    else:
+        print("Không phát hiện GPU/MPS. Đang sử dụng 'cpu'.")
+        return "cpu"
+    
 def extract_audio(video_input_path: str, audio_output_path: str) -> str | None:
     """
     Sử dụng ffmpeg để tách âm thanh từ tệp video đầu vào.
@@ -89,7 +106,7 @@ def extract_audio(video_input_path: str, audio_output_path: str) -> str | None:
         print(f"❌ LỖI không xác định: {e}")
         return None
 
-def transcribe_audio(audio_path: str, model_name: str) -> list[dict] | None:
+def transcribe_audio(audio_path: str, model_name: str, device: str) -> list[dict] | None:
     """
     Sử dụng Whisper để phiên âm âm thanh và lấy mốc thời gian.
     
@@ -106,47 +123,70 @@ def transcribe_audio(audio_path: str, model_name: str) -> list[dict] | None:
         Trả về None nếu có lỗi.
     """
 
-    # 1. Tự động phát hiện thiết bị (CPU, GPU-CUDA, Mac-MPS)
-    # Điều này thực hiện yêu cầu của bạn là hỗ trợ đa nền tảng
-    if torch.cuda.is_available():
-        device = "cuda"
-        print("Phát hiện GPU CUDA. Đang sử dụng 'cuda'.")
-    elif torch.backends.mps.is_available():
-        device = "mps"
-        print("Phát hiện Apple Silicon (M-series). Đang sử dụng 'mps'.")
-    else:
-        device = "cpu"
-        print("Không phát hiện GPU/MPS. Đang sử dụng 'cpu'.")
-        
     try:
-        # 2. Tải mô hình
-        # Lần chạy đầu tiên sẽ tải mô hình về (sẽ mất một lúc)
-        print(f"Đang tải mô hình Whisper '{model_name}' (lần đầu có thể mất vài phút)...")
         model = whisper.load_model(model_name, device=device)
-
-        # 3. Thực hiện phiên âm
-        # 'fp16=False' sẽ an toàn hơn cho CPU, nhưng chậm hơn
         use_fp16 = (device != "cpu")
-        print(f"Đang phiên âm (sử dụng fp16={use_fp16})...")
-        
-        # task="transcribe" sẽ chỉ trả về ngôn ngữ gốc
         result = model.transcribe(audio_path, fp16=use_fp16, task="transcribe")
-        
-        # 4. Trích xuất thông tin
         detected_lang = result.get('language', 'không rõ')
-        # print(f"✅ Bước 3 hoàn thành! Ngôn ngữ phát hiện: {detected_lang.upper()}")
-        
-        # Đây chính là phần bạn cần: danh sách các segment với mốc thời gian
-        segments = result['segments']
-        return segments
-
+        return result['segments']
     except Exception as e:
         print(f"❌ LỖI trong quá trình phiên âm: {e}")
         return None
     
+def translate_segments(segments: list[dict], model_name: str, device: str) -> list[dict] | None:
+    """
+    Dịch văn bản trong các segments sang tiếng Việt.
+    
+    Args:
+        segments: Danh sách segments từ Whisper (chứa 'start', 'end', 'text').
+        model_name: Tên mô hình dịch trên Hugging Face.
+        device: Thiết bị để chạy (cpu, cuda, mps).
+
+    Returns:
+        Danh sách segments mới với 'text' đã được dịch.
+    """
+    
+    try:
+        
+        # PyTorch index cho thiết bị (0 cho cuda/mps, -1 cho cpu)
+        torch_device_index = 0 if device in ["cuda", "mps"] else -1
+        translator = pipeline("translation", 
+                              model=model_name, 
+                              device=torch_device_index)
+
+        # 2. Chuẩn bị dữ liệu (dịch theo batch cho nhanh)
+        # Lấy văn bản (đã loại bỏ khoảng trắng thừa) từ mỗi segment
+        texts_to_translate = [segment['text'].strip() for segment in segments]
+        
+        # 3. Thực hiện dịch
+        translated_results = translator(texts_to_translate, batch_size=16) # batch_size=16
+
+        # 4. Tạo lại danh sách segments với văn bản đã dịch
+        translated_segments = []
+        for i, segment in enumerate(segments):
+            translated_text = translated_results[i]['translation_text']
+            
+            new_segment = {
+                "id": segment['id'],
+                "start": segment['start'],
+                "end": segment['end'],
+                "original_text": segment['text'], # Giữ lại văn bản gốc để tham khảo
+                "text": translated_text  # Thay thế bằng văn bản đã dịch
+            }
+            translated_segments.append(new_segment)
+            
+        # print(f"✅ Bước 4 hoàn thành!")
+        return translated_segments
+        
+    except Exception as e:
+        print(f"❌ LỖI trong quá trình dịch thuật: {e}")
+        return None
+    
 # ---- Hàm chính để chạy ứng dụng ----
 def main():
-    
+    # Xác định thiết bị chạy AI (chạy 1 lần ở đầu)
+    device = get_device()
+
     # Kiểm tra xem tệp video đầu vào có tồn tại không
     if not os.path.exists(VIDEO_INPUT_PATH):
         print(f"❌ LỖI: Không tìm thấy tệp video đầu vào tại:")
@@ -162,21 +202,23 @@ def main():
         sys.exit(1)
         
     # Bước 3: Phiên âm (Audio to Text)
-    segments = transcribe_audio(AUDIO_OUTPUT_PATH, WHISPER_MODEL_NAME)
-    if segments is None:
-        print("Dừng chương trình do lỗi ở Bước 3.")
-        sys.exit(1)
+    if os.path.exists(TRANSCRIPT_OUTPUT_PATH):
+        print(f"\nĐã tìm thấy tệp phiên âm: {TRANSCRIPT_OUTPUT_PATH}. Bỏ qua Bước 3.")
+        with open(TRANSCRIPT_OUTPUT_PATH, 'r', encoding='utf-8') as f:
+            segments = json.load(f)
     else:
+        segments = transcribe_audio(AUDIO_OUTPUT_PATH, WHISPER_MODEL_NAME, device)
+        if segments is None: sys.exit(1)
+        
+        # Lưu tệp JSON
+        print(f"\nĐang lưu kết quả phiên âm vào '{TRANSCRIPT_OUTPUT_PATH}'...")
         try:
             with open(TRANSCRIPT_OUTPUT_PATH, 'w', encoding='utf-8') as f:
-                # indent=4: Giúp tệp JSON dễ đọc (pretty print)
-                # ensure_ascii=False: Hỗ trợ ký tự Unicode (quan trọng nếu 
-                #                     ngôn ngữ gốc có dấu, ví dụ tiếng Pháp, TBN...)
                 json.dump(segments, f, indent=4, ensure_ascii=False)
             print("✅ Đã lưu phiên âm thành công.")
         except Exception as e:
             print(f"❌ LỖI: Không thể lưu tệp JSON phiên âm: {e}")
-            sys.exit(1) # Nếu không lưu được, chúng ta cũng nên dừng lại
+            sys.exit(1)
 
 
     # In ra 3 segment đầu tiên để kiểm tra
@@ -187,6 +229,35 @@ def main():
         text = segment['text'].strip()
         print(f"[{start:.2f}s -> {end:.2f}s] {text}")
     print("---------------------------------------------")
+
+    # Bước 4: Dịch thuật
+    translated_segments = translate_segments(segments, TRANSLATION_MODEL_NAME, device)
+    if translated_segments is None: sys.exit(1)
+        
+    # Lưu tệp JSON đã dịch
+    # print(f"\nĐang lưu kết quả dịch thuật vào '{TRANSLATED_TRANSCRIPT_PATH}'...")
+    try:
+        with open(TRANSLATED_TRANSCRIPT_PATH, 'w', encoding='utf-8') as f:
+            # ensure_ascii=False RẤT QUAN TRỌNG để lưu tiếng Việt
+            json.dump(translated_segments, f, indent=4, ensure_ascii=False)
+        # print("✅ Đã lưu dịch thuật thành công.")
+    except Exception as e:
+        print(f"❌ LỖI: Không thể lưu tệp JSON dịch thuật: {e}")
+        sys.exit(1)
+
+    # In ra 3 segment đã dịch đầu tiên để kiểm tra
+    print("\n--- Kết quả dịch thuật (3 segment đầu tiên) ---")
+    for i, segment in enumerate(translated_segments[:3]):
+        start = segment['start']
+        end = segment['end']
+        text = segment['text'].strip()
+        print(f"[{start:.2f}s -> {end:.2f}s] {text}")
+    print("-------------------------------------------------")
+    
+    print("\n(Tạm thời kết thúc - Các bước tiếp theo sẽ được xây dựng)")
+    print("-----------------------------------")
+
+
 
 if __name__ == "__main__":
     main()

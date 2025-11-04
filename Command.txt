@@ -5,5 +5,9 @@ docker run -it --rm \
   -v "$(pwd)/main.py:/app/main.py" \
   -v "$(pwd)/source:/app/source" \
   -v "$(pwd)/.cache/whisper:/root/.cache/whisper" \
+  -v "$(pwd)/.cache/huggingface:/root/.cache/huggingface" \
   ai-dubbing \
   python main.py
+
+
+pip install torch torchaudio openai-whisper transformers sentencepiece piper-tts
