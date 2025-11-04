@@ -5,6 +5,7 @@ import torch
 import whisper
 from transformers import pipeline 
 from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 import json
 import pprint
 import argparse
@@ -44,7 +45,7 @@ FINAL_VIDEO_NAME = "final_dubbed_video.mp4"
 FINAL_VIDEO_PATH = os.path.join(SOURCE_FOLDER, FINAL_VIDEO_NAME)
 
 # Cấu hình mô hình
-WHISPER_MODEL_NAME = "medium.en"
+WHISPER_MODEL_NAME = "small.en"
 # Mô hình dịch thuật
 TRANSLATION_MODEL_NAME = "Helsinki-NLP/opus-mt-en-vi"
 
@@ -55,6 +56,12 @@ WHISPER_OPTIONS = {
     "hallucination_silence_threshold": 3.0, # Xóa ảo giác trong khoảng lặng > 3 giây
     "word_timestamps": True,     # Bật để tăng độ chính xác của mốc thời gian
     "fp16": False                # Đặt là False nếu chạy trên CPU (an toàn)
+}
+# Cấu hình VAD (Voice Activity Detection)
+VAD_OPTIONS = {
+    "min_silence_len": 1000, # (ms) Khoảng lặng tối thiểu để tính là "im lặng"
+    "silence_thresh": -32,   # (dBFS) Ngưỡng âm lượng, càng thấp càng nhạy
+    "keep_silence": 200      # (ms) Giữ lại một chút im lặng ở đầu/cuối
 }
 # ----------------------------------------
 
@@ -130,43 +137,115 @@ def extract_audio(video_input_path: str, audio_output_path: str) -> str | None:
 
 def transcribe_audio(audio_path: str, model_name: str, device: str) -> list[dict] | None:
     """
-    Sử dụng Whisper để phiên âm âm thanh và lấy mốc thời gian.
-    
-    Args:
-        audio_path: Đường dẫn đến tệp âm thanh .wav
-        model_name: Tên mô hình Whisper (ví dụ: "base", "small", "medium")
-
-    Returns:
-        Một danh sách (list) các 'segments'. 
-        Ví dụ: [
-            {'start': 0.0, 'end': 5.2, 'text': ' Hello world.'},
-            {'start': 5.2, 'end': 8.0, 'text': ' This is a test.'}
-        ]
-        Trả về None nếu có lỗi.
+    Phiên âm bằng VAD + Whisper để có mốc thời gian chính xác.
     """
-
+    # print(f"\nBắt đầu Bước 3: Phiên âm (Sử dụng VAD)...")
     try:
+        # 1. Tải mô hình Whisper
+        # print(f"Đang tải mô hình Whisper '{model_name}'...")
         model = whisper.load_model(model_name, device=device)
-        
-        # Cập nhật tùy chọn fp16 dựa trên thiết bị
+        # print("Tải mô hình hoàn tất.")
+
+        # Cập nhật tùy chọn fp16
         transcribe_options = WHISPER_OPTIONS.copy()
         transcribe_options["fp16"] = (device != "cpu")
+        # print(f"Đang phiên âm với các tùy chọn: {transcribe_options}")
 
-        # Sử dụng **để giải nén (unpack) dictionary vào các tham số
-        result = model.transcribe(audio_path, task="transcribe", **transcribe_options)
+        # 2. Tải âm thanh bằng Pydub
+        # print(f"Đang tải âm thanh từ: {audio_path}")
+        audio = AudioSegment.from_wav(audio_path)
+
+        # 3. Chạy VAD (Phát hiện các đoạn không im lặng)
+        # print(f"Đang chạy VAD (Phát hiện giọng nói)...")
+        speech_chunks = detect_nonsilent(
+            audio,
+            min_silence_len=VAD_OPTIONS["min_silence_len"],
+            silence_thresh=VAD_OPTIONS["silence_thresh"]
+        )
         
-        print(f"✅ Bước 3 hoàn thành! Ngôn ngữ: {result.get('language', 'không rõ')}")
+        if not speech_chunks:
+            print("❌ LỖI: VAD không tìm thấy bất kỳ giọng nói nào trong tệp.")
+            return None
+
+        total_chunks = len(speech_chunks)
+        print(f"VAD đã tìm thấy {total_chunks} đoạn có giọng nói.")
         
-        # In ra segment đầu tiên để kiểm tra mốc thời gian
-        if result['segments']:
-            seg0 = result['segments'][0]
-            print(f"   Kiểm tra: Segment 0 bắt đầu từ {seg0['start']:.2f}s")
+        all_segments = []
+        segment_id_counter = 0
+        temp_chunk_path = os.path.join(SOURCE_FOLDER, "temp_chunk.wav") # Định nghĩa 1 lần
+
+        # 4. Lặp qua từng đoạn có tiếng và chạy Whisper
+        for i, chunk_ms in enumerate(speech_chunks):
+            original_start_ms, original_end_ms = chunk_ms
+            
+            # === LOG MỚI ===
+            print(f"\n   --- VAD Chunk {i+1}/{total_chunks} ---")
+            print(f"   Đoạn VAD gốc: {original_start_ms/1000:.2f}s -> {original_end_ms/1000:.2f}s")
+            
+            # Giữ lại một chút đệm im lặng (tùy chọn)
+            start_ms = max(0, original_start_ms - VAD_OPTIONS["keep_silence"])
+            end_ms = min(len(audio), original_end_ms + VAD_OPTIONS["keep_silence"])
+            
+            # === LOG MỚI ===
+            print(f"   Đoạn đã đệm (gửi cho Whisper): {start_ms/1000:.2f}s -> {end_ms/1000:.2f}s (Thời lượng: {(end_ms-start_ms)/1000:.2f}s)")
+            
+            # Cắt đoạn âm thanh
+            audio_chunk = audio[start_ms:end_ms]
+            
+            # Cần lưu ra tệp tạm để Whisper đọc
+            audio_chunk.export(temp_chunk_path, format="wav")
+
+            # 5. Chạy Whisper trên đoạn âm thanh đã cắt
+            # === LOG MỚI ===
+            print(f"   ...Đang chạy Whisper trên đoạn này...")
+            result = model.transcribe(temp_chunk_path, task="transcribe", **transcribe_options)
+            
+            if not result['segments']:
+                # === LOG MỚI ===
+                print(f"   ...Whisper không tìm thấy văn bản nào trong đoạn này.")
+                continue # Bỏ qua nếu Whisper không nghe thấy gì
+
+            # === LOG MỚI ===
+            print(f"   ...Whisper tìm thấy {len(result['segments'])} segment(s) trong đoạn này:")
+
+            # 6. Điều chỉnh lại mốc thời gian
+            for segment in result['segments']:
+                # Tính toán mốc thời gian cuối cùng bằng cách cộng offset
+                offset_start_sec = (segment['start'] * 1000 + start_ms) / 1000.0
+                offset_end_sec = (segment['end'] * 1000 + start_ms) / 1000.0
+                
+                new_segment = {
+                    'id': segment_id_counter,
+                    'start': offset_start_sec,
+                    'end': offset_end_sec,
+                    'text': segment['text']
+                }
+                
+                # === LOG MỚI ===
+                text_preview = segment['text'].strip()[:50] # Lấy 50 ký tự đầu
+                if len(segment['text'].strip()) > 50:
+                    text_preview += "..."
+                print(f"      -> Segment ID {segment_id_counter}: [{offset_start_sec:.2f}s -> {offset_end_sec:.2f}s] {text_preview}")
+
+                all_segments.append(new_segment)
+                segment_id_counter += 1
         
-        return result['segments']
+        # Dọn dẹp tệp tạm
+        if os.path.exists(temp_chunk_path):
+            os.remove(temp_chunk_path)
+
+        print(f"✅ Bước 3 hoàn thành! Đã phiên âm {len(all_segments)} segments.")
+        
+        if all_segments:
+            seg0 = all_segments[0]
+            print(f"   Kiểm tra: Segment 0 (ID {seg0['id']}) bắt đầu từ {seg0['start']:.2f}s")
+
+        return all_segments
+
     except Exception as e:
-        print(f"❌ LỖI trong quá trình phiên âm: {e}")
+        print(f"❌ LỖI trong quá trình phiên âm VAD: {e}")
         return None
-    
+        
 def translate_segments(segments: list[dict], model_name: str, device: str) -> list[dict] | None:
     """
     Dịch văn bản trong các segments sang tiếng Việt.
