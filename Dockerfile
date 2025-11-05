@@ -29,7 +29,8 @@ RUN pip install --no-cache-dir \
     transformers \
     sentencepiece \
     sacremoses \
-    pydub
+    pydub \
+    protobuf
 
 # (Tùy chọn) Tải trước các mô hình để Docker image chứa sẵn
 # RUN python -c "import whisper; whisper.load_model('base')"

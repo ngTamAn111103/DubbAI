@@ -23,16 +23,16 @@ BASE_DIR = os.path.dirname(script_path)
 # Xây dựng các đường dẫn khác dựa trên BASE_DIR
 SOURCE_FOLDER = os.path.join(BASE_DIR, "source")
 VIDEO_INPUT_NAME = "test1.mp4"
-AUDIO_OUTPUT_NAME = "original_audio.wav"
+AUDIO_OUTPUT_NAME = "original_audio.wav" # Bước 1 +2
 
 VIDEO_INPUT_PATH = os.path.join(SOURCE_FOLDER, VIDEO_INPUT_NAME)
 AUDIO_OUTPUT_PATH = os.path.join(SOURCE_FOLDER, AUDIO_OUTPUT_NAME)
 
 # Tệp JSON chứa kết quả phiên âm
-TRANSCRIPT_OUTPUT_NAME = "original_transcript.json"
+TRANSCRIPT_OUTPUT_NAME = "original_transcript.json" # Bước 3
 TRANSCRIPT_OUTPUT_PATH = os.path.join(SOURCE_FOLDER, TRANSCRIPT_OUTPUT_NAME)
 # Tệp JSON dịch thuật Anh -> Việt
-TRANSLATED_TRANSCRIPT_NAME = "translated_transcript.json"
+TRANSLATED_TRANSCRIPT_NAME = "translated_transcript.json" # Bước 4
 TRANSLATED_TRANSCRIPT_PATH = os.path.join(SOURCE_FOLDER, TRANSLATED_TRANSCRIPT_NAME)
 # Tệp chứa mảng dữ liệu TTS
 # Chúng ta có thể lưu nó dưới dạng tệp .py để dễ import sau này
@@ -45,9 +45,10 @@ FINAL_VIDEO_NAME = "final_dubbed_video.mp4"
 FINAL_VIDEO_PATH = os.path.join(SOURCE_FOLDER, FINAL_VIDEO_NAME)
 
 # Cấu hình mô hình
-WHISPER_MODEL_NAME = "small.en"
+WHISPER_MODEL_NAME = "medium.en"
 # Mô hình dịch thuật
 TRANSLATION_MODEL_NAME = "Helsinki-NLP/opus-mt-en-vi"
+# TRANSLATION_MODEL_NAME = "vinai/vinai-translate-en2vi"
 
 # Cấu hình tùy chọn cho Whisper
 # Đây là nơi bạn "tinh chỉnh" (tune) để sửa lỗi mốc thời gian
@@ -260,35 +261,66 @@ def translate_segments(segments: list[dict], model_name: str, device: str) -> li
     """
     
     try:
-        
-        # PyTorch index cho thiết bị (0 cho cuda/mps, -1 cho cpu)
+        # 1. Tải pipeline dịch thuật
         torch_device_index = 0 if device in ["cuda", "mps"] else -1
+        task_name = "translation_en_to_vi" # Chỉ định rõ task
+        
+        # Dành cho model dịch 2
+        # translator = pipeline(task_name, 
+        #                       model=model_name, 
+        #                       device=torch_device_index)
+        
         translator = pipeline("translation", 
                               model=model_name, 
                               device=torch_device_index)
+        # print("Tải mô hình dịch hoàn tất. Bắt đầu dịch...")
 
-        # 2. Chuẩn bị dữ liệu (dịch theo batch cho nhanh)
-        # Lấy văn bản (đã loại bỏ khoảng trắng thừa) từ mỗi segment
+        # 2. Chuẩn bị dữ liệu
         texts_to_translate = [segment['text'].strip() for segment in segments]
+        total_segments = len(texts_to_translate)
         
-        # 3. Thực hiện dịch
-        translated_results = translator(texts_to_translate, batch_size=16) # batch_size=16
+        # === LOGIC MỚI: DỊCH THEO BATCH ĐỂ LOG TIẾN ĐỘ ===
+        batch_size = 16  # Dịch 16 câu một lúc
+        all_translated_results = []
+        
+        # Tính toán tổng số batch
+        total_batches = (total_segments + batch_size - 1) // batch_size
+        
+        for i in range(0, total_segments, batch_size):
+            # Lấy 1 batch văn bản
+            batch_texts = texts_to_translate[i : i + batch_size]
+            
+            # Dịch batch này
+            # (Không cần tham số 'batch_size' trong translator vì batch_texts đã nhỏ rồi)
+            translated_batch = translator(batch_texts)
+            
+            # Lưu kết quả
+            all_translated_results.extend(translated_batch)
+            
+            # IN LOG TIẾN ĐỘ
+            current_batch_num = (i // batch_size) + 1
+            segments_done = min(i + batch_size, total_segments)
+            print(f"   ... Đã dịch xong batch {current_batch_num} / {total_batches} (Hoàn thành {segments_done}/{total_segments} segments)")
+        # === KẾT THÚC LOGIC MỚI ===
+
+        print("Dịch thuật hoàn tất.")
 
         # 4. Tạo lại danh sách segments với văn bản đã dịch
         translated_segments = []
+        # Sử dụng 'all_translated_results' thay vì 'translated_results'
         for i, segment in enumerate(segments):
-            translated_text = translated_results[i]['translation_text']
+            translated_text = all_translated_results[i]['translation_text']
             
             new_segment = {
                 "id": segment['id'],
                 "start": segment['start'],
                 "end": segment['end'],
-                "original_text": segment['text'], # Giữ lại văn bản gốc để tham khảo
-                "text": translated_text  # Thay thế bằng văn bản đã dịch
+                "original_text": segment['text'],
+                "text": translated_text
             }
             translated_segments.append(new_segment)
             
-        # print(f"✅ Bước 4 hoàn thành!")
+        print(f"✅ Bước 4 hoàn thành!")
         return translated_segments
         
     except Exception as e:
@@ -639,7 +671,7 @@ def main(args): # MỚI: 'args' được truyền vào
             extracted_audio_file = extract_audio(VIDEO_INPUT_PATH, AUDIO_OUTPUT_PATH)
             if extracted_audio_file is None: sys.exit(1)
         else:
-            print(f"Đã tìm thấy âm thanh gốc: {AUDIO_OUTPUT_PATH}. Bỏ qua Bước 1.")
+            print(f"Đã tìm thấy âm thanh gốc: {AUDIO_OUTPUT_PATH}. Bỏ qua Bước 1 và 2.")
         
         # --- Bước 3: Phiên âm ---
         if os.path.exists(TRANSCRIPT_OUTPUT_PATH):
