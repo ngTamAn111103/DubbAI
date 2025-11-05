@@ -7,7 +7,7 @@ docker run -it --rm \
   -v "$(pwd)/.cache/whisper:/root/.cache/whisper" \
   -v "$(pwd)/.cache/huggingface:/root/.cache/huggingface" \
   ai-dubbing \
-  python main.py --step prep
+  python main.py
 
 # 6
 docker run -it --rm \

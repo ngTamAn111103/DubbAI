@@ -17,20 +17,20 @@ WORKDIR /app
 
 # Cài đặt các thư viện Python cần thiết
 # Chúng ta sẽ cài đặt các thư viện chính trước
-RUN pip install --no-cache-dir \
-    torch \
-    torchaudio 
+# RUN pip install --no-cache-dir \
+#     torch \
+#     torchaudio 
 # Lưu ý: Dòng trên cài đặt torch phiên bản CPU để đảm bảo tính tương thích
 # cao nhất (cho Windows, Linux, Mac). Chúng ta sẽ thảo luận về MPS/GPU sau.
 
 # Cài đặt các thư viện AI và tiện ích
-RUN pip install --no-cache-dir \
-    openai-whisper \
-    transformers \
-    sentencepiece \
-    sacremoses \
-    pydub \
-    protobuf
+# RUN pip install --no-cache-dir \
+#     openai-whisper \
+#     transformers \
+#     sentencepiece \
+#     sacremoses \
+#     pydub \
+#     protobuf
 
 # (Tùy chọn) Tải trước các mô hình để Docker image chứa sẵn
 # RUN python -c "import whisper; whisper.load_model('base')"
