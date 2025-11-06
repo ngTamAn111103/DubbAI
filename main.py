@@ -1,32 +1,64 @@
-from pydub.silence import detect_nonsilent
-import json
-from pydub import AudioSegment
+# Thư viện
+from dotenv import load_dotenv
+import time
+import torch
 import os
-import sys
 import subprocess
+import sys
 import whisper
+import json
+from transformers import MarianMTModel, MarianTokenizer,pipeline 
+import math
+import pprint
+
+# Bắt đầu tính giờ
+start_time = time.time()
+load_dotenv()
+
+# Cấu hình hạn chế đụng vào
 script_path = os.path.abspath(__file__)
 BASE_DIR = os.path.dirname(script_path)
+AUDIO_OUTPUT_NAME = os.getenv("AUDIO_OUTPUT_NAME")
+VIDEO_INPUT_NAME = os.getenv("VIDEO_INPUT_NAME")
 SOURCE_FOLDER = os.path.join(BASE_DIR, "source")
-VIDEO_INPUT_NAME = "test1.mp4"
-AUDIO_OUTPUT_NAME = "original_audio.wav" # Bước 1 +2
-VIDEO_INPUT_PATH = os.path.join(SOURCE_FOLDER, VIDEO_INPUT_NAME)
 AUDIO_OUTPUT_PATH = os.path.join(SOURCE_FOLDER, AUDIO_OUTPUT_NAME)
-TRANSCRIPT_OUTPUT_NAME = "original_transcript.json" # Bước 3
+VIDEO_INPUT_PATH = os.path.join(SOURCE_FOLDER, VIDEO_INPUT_NAME)
+TRANSCRIPT_OUTPUT_NAME = "original_transcript.json"
 TRANSCRIPT_OUTPUT_PATH = os.path.join(SOURCE_FOLDER, TRANSCRIPT_OUTPUT_NAME)
-WHISPER_MODEL_NAME = "large-v3" # Mô hình mạnh nhất
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME")
+TRANSLATION_MODEL_NAME = os.getenv("TRANSLATION_MODEL_NAME")
+TTS_DATA_NAME = os.getenv("TTS_DATA_NAME")
+TRANSLATED_TRANSCRIPT_NAME = "translated_transcript.json" # Bước 4
+TRANSLATED_TRANSCRIPT_PATH = os.path.join(SOURCE_FOLDER, TRANSLATED_TRANSCRIPT_NAME)
+TTS_DATA_PATH = os.path.join(SOURCE_FOLDER, TTS_DATA_NAME)
+
+def to_bool(value: str) -> bool:
+    """
+    Hàm trợ giúp để chuyển string "True" -> boolean True
+    """
+    return str(value).lower() in ['true', '1', 't', 'yes']
+
+# Đọc và TỰ CHUYỂN ĐỔI kiểu dữ liệu
 WHISPER_OPTIONS = {
-    # Chúng ta sẽ tắt fp16 trong hàm, dựa trên device
-    "word_timestamps": True,              # Rất quan trọng: Lấy mốc thời gian của TỪNG TỪ
-    "condition_on_previous_text": True, # Giữ ngữ cảnh, giảm lặp (Mỗi tiếng anh ~~ True)
-    "suppress_tokens": "-1",            # Đảm bảo timestamp được tạo ra
-    "no_speech_threshold": 0.5,         # Ngưỡng phát hiện không có tiếng nói (linh hoạt hơn)
+    # .getenv("KEY", "default_value")
+    "word_timestamps": to_bool(os.getenv("WHISPER_WORD_TIMESTAMPS", "True")),
+    "condition_on_previous_text": to_bool(os.getenv("WHISPER_CONDITION_ON_PREVIOUS_TEXT", "True")),
+    "suppress_tokens": os.getenv("WHISPER_SUPPRESS_TOKENS", "-1"),
+    "no_speech_threshold": float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", 0.5)),
 }
-VAD_OPTIONS = {
-    "min_silence_len": 1000, # (ms) Khoảng lặng tối thiểu để tính là "im lặng"
-    "silence_thresh": -32,   # (dBFS) Ngưỡng âm lượng, càng thấp càng nhạy
-    "keep_silence": 200      # (ms) Giữ lại một chút im lặng ở đầu/cuối
-}
+
+def get_device() -> str:
+    """Kiểm tra và trả về thiết bị (device) phù hợp cho PyTorch."""
+    if torch.cuda.is_available():
+        print("Phát hiện GPU CUDA. Đang sử dụng 'cuda'.")
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        print("Phát hiện Apple Silicon (M-series). Đang sử dụng 'mps'.")
+        return "mps"
+    else:
+        print("Không phát hiện GPU/MPS. Đang sử dụng 'cpu'.")
+        return "cpu"
+    
 def extract_audio(video_input_path: str, audio_output_path: str) -> str | None:
     """
     Sử dụng ffmpeg để tách âm thanh từ tệp video đầu vào.
@@ -84,6 +116,52 @@ def extract_audio(video_input_path: str, audio_output_path: str) -> str | None:
     except Exception as e:
         print(f"❌ LỖI không xác định: {e}")
         return None
+    
+def transcribe_audio(audio_path: str, model_name: str, device: str) -> dict | None:
+    """
+    Phiên âm âm thanh bằng Whisper, để mô hình tự xử lý VAD và segmentation.
+    Hàm này sẽ trả về toàn bộ kết quả của Whisper, bao gồm cả "word-level timestamps".
+    
+    Args:
+        audio_path: Đường dẫn đến tệp .wav
+        model_name: Tên mô hình (ví dụ: "medium.en")
+        device: Thiết bị chạy ("cpu", "cuda", "mps")
+
+    Returns:
+        Toàn bộ đối tượng `result` của Whisper, hoặc None nếu lỗi.
+    """
+    print(f"\nBắt đầu Bước 3: Phiên âm (Whisper-native VAD)...")
+    try:
+        # 1. Tải mô hình
+        model = whisper.load_model(model_name, device=device)
+
+        # 2. Định cấu hình tùy chọn
+        transcribe_options = WHISPER_OPTIONS.copy()
+        
+        # Tự động quyết định dùng fp16 (tăng tốc) nếu không phải CPU
+        # fp16 không được hỗ trợ tốt trên CPU
+        transcribe_options["fp16"] = (device != "cpu")
+        
+        # Chọn ngôn ngữ (rất quan trọng nếu sau này nâng cấp)
+        # Báo cho Whisper biết đây là tiếng Anh
+        if WHISPER_OPTIONS["condition_on_previous_text"]:
+            transcribe_options["language"] = "en" # Tối ưu cho englist
+
+        transcribe_options["task"] = "transcribe" # Chỉ phiên âm, không dịch
+
+        # 3. Chạy phiên âm (Đây là bước chính)
+        # Đưa toàn bộ tệp âm thanh vào, không cần cắt
+        result = model.transcribe(audio_path, **transcribe_options)
+        print(f"✅ Bước 3 hoàn thành!")
+        return result
+
+    except Exception as e:
+        print(f"❌ LỖI trong quá trình phiên âm: {e}")
+        # In thêm chi tiết lỗi nếu có (ví dụ: lỗi CUDA)
+        import traceback
+        traceback.print_exc()
+        return None
+
 def merge_short_segments(segments: list[dict], max_gap_sec: float = 1.5, min_segment_len_sec: float = 2.0) -> list[dict]:
     """
     Hợp nhất các segment ngắn dựa trên khoảng lặng và độ dài.
@@ -129,87 +207,187 @@ def merge_short_segments(segments: list[dict], max_gap_sec: float = 1.5, min_seg
     print(f"✅ Hợp nhất hoàn tất: còn {len(merged_segments)} segments.")
     return merged_segments
 
-
-def transcribe_audio(audio_path: str, model_name: str, device: str) -> dict | None:
+def translate_segments(whisper_result: dict, model_name: str, device: str, batch_size: int = 8 ) -> dict | None:
     """
-    Phiên âm âm thanh bằng Whisper, để mô hình tự xử lý VAD và segmentation.
-    Hàm này sẽ trả về toàn bộ kết quả của Whisper, bao gồm cả "word-level timestamps".
-    
+    Dịch các segment văn bản từ Anh sang Việt, giữ nguyên cấu trúc dict.
+    Tối ưu hóa để sử dụng bộ nhớ ổn định (KHẮC PHỤC RÒ RỈ BỘ NHỚ MPS/CUDA).
+
     Args:
-        audio_path: Đường dẫn đến tệp .wav
-        model_name: Tên mô hình (ví dụ: "medium.en")
-        device: Thiết bị chạy ("cpu", "cuda", "mps")
+        whisper_result (dict): json phiên âm (text englist)
+        model_name (str): Model dịch thuật (Helsinki-NLP/opus-mt-en-vi, ...)
+        device (str): cuda, mps, cpu
 
     Returns:
-        Toàn bộ đối tượng `result` của Whisper, hoặc None nếu lỗi.
+        dict | None: json 
     """
-    print(f"\nBắt đầu Bước 3: Phiên âm (Whisper-native VAD)...")
     try:
-        # 1. Tải mô hình
-        # print(f"Đang tải mô hình Whisper '{model_name}' trên '{device}'...")
-        model = whisper.load_model(model_name, device=device)
-        # print("Tải mô hình hoàn tất.")
+        # 1. Tải mô hình và tokenizer
+        tokenizer = MarianTokenizer.from_pretrained(model_name)
+        model = MarianMTModel.from_pretrained(model_name)
+        model.to(device)
 
-        # 2. Định cấu hình tùy chọn
-        transcribe_options = WHISPER_OPTIONS.copy()
+        # 2. Tạo bản sao dữ liệu NGAY TỪ ĐẦU
+        segments_to_translate = whisper_result.get('segments', [])
+        if not segments_to_translate:
+            print("❌ LỖI: Không tìm thấy 'segments' trong dữ liệu đầu vào.")
+            return None
+            
+        translated_data = json.loads(json.dumps(whisper_result))
         
-        # Tự động quyết định dùng fp16 (tăng tốc) nếu không phải CPU
-        # fp16 không được hỗ trợ tốt trên CPU
-        transcribe_options["fp16"] = (device != "cpu")
+        # Chỉ lấy đoạn text tiếng anh
+        texts_to_translate = [seg['text'].strip() for seg in segments_to_translate]
+        total_segments = len(texts_to_translate)
+
+        # 3. Logic batching
+        total_batches = math.ceil(total_segments / batch_size)
         
-        # Chọn ngôn ngữ (rất quan trọng nếu sau này nâng cấp)
-        # Báo cho Whisper biết đây là tiếng Anh
-        transcribe_options["language"] = "en" # Tối ưu cho englist
-        transcribe_options["task"] = "transcribe" # Chỉ phiên âm, không dịch
+        print(f"Chuẩn bị dịch {total_segments} segments thành {total_batches} batches ({batch_size} segments/batch)...")
 
-        # print(f"Đang phiên âm '{audio_path}' với các tùy chọn:")
-        # print(f"   {transcribe_options}")
+        for i in range(0, total_segments, batch_size):
+            batch_texts = texts_to_translate[i : i + batch_size]
+            
+            # --- BẮT ĐẦU KHỐI TỐN BỘ NHỚ ---
+            batch_tokens = tokenizer(
+                batch_texts, 
+                return_tensors="pt", 
+                padding=True
+            ).to(device)
+            
+            translated_tokens = model.generate(**batch_tokens)
+            
+            translated_batch_texts = [
+                tokenizer.decode(t, skip_special_tokens=True) for t in translated_tokens
+            ]
+            # --- KẾT THÚC KHỐI TỐN BỘ NHỚ ---
 
-        # 3. Chạy phiên âm (Đây là bước chính)
-        # Đưa toàn bộ tệp âm thanh vào, không cần cắt
-        result = model.transcribe(audio_path, **transcribe_options)
+            # Cập nhật trực tiếp vào 'translated_data'
+            for j in range(len(translated_batch_texts)):
+                segment_index = i + j
+                translated_data['segments'][segment_index]['original_text'] = translated_data['segments'][segment_index]['text']
+                translated_data['segments'][segment_index]['text'] = translated_batch_texts[j]
+
+            # IN LOG TIẾN ĐỘ
+            current_batch_num = (i // batch_size) + 1
+            segments_done = min(i + batch_size, total_segments)
+            print(f"   ... Đã dịch xong batch {current_batch_num} / {total_batches} (Hoàn thành {segments_done}/{total_segments} segments)")
+
+            # ==========================================================
+            # === DỌN DẸP BỘ NHỚ THỦ CÔNG (RẤT QUAN TRỌNG) ===
+            del batch_tokens
+            del translated_tokens
+            if device == "mps":
+                torch.mps.empty_cache()
+            elif device == "cuda":
+                torch.cuda.empty_cache()
+            # ==========================================================
+
+        print("Dịch thuật hoàn tất.")
+
+        # 4. Trả về kết quả
+        print(f"✅ Bước 4 hoàn thành!")
+        return translated_data
         
-        print(f"✅ Bước 3 hoàn thành!")
-        # print(f"   Phát hiện ngôn ngữ: {result.get('language')}")
-        # print(f"   Tìm thấy {len(result.get('segments', []))} segments.")
-
-        return result
-
     except Exception as e:
-        print(f"❌ LỖI trong quá trình phiên âm: {e}")
-        # In thêm chi tiết lỗi nếu có (ví dụ: lỗi CUDA)
+        print(f"❌ LỖI trong quá trình dịch thuật: {e}")
         import traceback
         traceback.print_exc()
         return None
+
+def generate_tts_data_file(translated_segments: list[dict], output_script_path: str):
+    """
+    Tạo mảng dữ liệu TTS và GHI NỘI DUNG MẢNG đó ra tệp.
+    Đồng thời trả về danh sách segments đã cập nhật cho Bước 6.
+    """
+    # print(f"\nBắt đầu Bước 5: Ghi mảng dữ liệu TTS vào '{output_script_path}'...")
     
+    tts_data_list = []
+    segments_with_audio_path = []
+    
+    try:
+        # Lặp qua các segment đã dịch
+        for segment in translated_segments['segments']:
+            segment_id = segment['id']
+            text_to_speak = segment['text'].strip()
+            
+            # 1. Tạo dữ liệu cho mảng
+            formatted_text = f"[KienThucQuanSu]{text_to_speak}"
+            audio_output_file = f"audio_VN/{segment_id}.wav"
+            
+            tts_tuple = (formatted_text, audio_output_file)
+            tts_data_list.append(tts_tuple)
+            
+            # 2. Cập nhật segment cho Bước 6
+            segment['audio_path'] = os.path.join(SOURCE_FOLDER, audio_output_file)
+            segments_with_audio_path.append(segment)
+
+        # 3. Ghi mảng (dưới dạng chuỗi) ra tệp
+        with open(output_script_path, 'w', encoding='utf-8') as f:
+            # Sử dụng pprint.pformat để tạo chuỗi Python đẹp
+            # indent=4 và width=120 (để tránh ngắt dòng quá sớm)
+            # Sẽ tạo ra định dạng giống hệt ví dụ của bạn
+            file_content = pprint.pformat(tts_data_list, indent=4, width=120)
+            
+            # Ghi vào tệp. 
+            # (Bạn có thể thêm `tts_data = ` ở đầu nếu muốn nó là tệp .py)
+            # f.write("tts_data = ")
+            f.write(file_content)
+            # f.write("\n") 
+
+        print(f"✅ Bước 5 hoàn thành! Đã ghi mảng dữ liệu vào tệp.")
+        # Trả về danh sách segment đã cập nhật cho Bước 6
+        return segments_with_audio_path
+
+    except Exception as e:
+        print(f"❌ LỖI trong quá trình ghi tệp dữ liệu TTS: {e}")
+        return None
 def main():
-    device = "cpu" 
-    
-    # Bước 1 + 2: Tách âm thanh
+
+    # --- Bước 1 & 2: Tách âm thanh ---
+    # Nếu chưa có file .wav
     if not os.path.exists(AUDIO_OUTPUT_PATH):
         extracted_audio_file = extract_audio(VIDEO_INPUT_PATH, AUDIO_OUTPUT_PATH)
-        if extracted_audio_file is None: sys.exit(1)
-        
-    # Bước 3: Phiên âm
+        if extracted_audio_file is None: 
+            sys.exit(1)
+    
+
+    # --- Bước 3: Phiên âm ---
+    # Nếu chưa có file phiên âm [original_transcript].json
     if not os.path.exists(TRANSCRIPT_OUTPUT_PATH):
-        print("Bước 3: Phiên âm âm thanh gốc thành văn bản")
-        segments = transcribe_audio(AUDIO_OUTPUT_PATH, WHISPER_MODEL_NAME, device)
+        whisper_result = transcribe_audio(AUDIO_OUTPUT_PATH, WHISPER_MODEL_NAME, get_device())
 
         # Phiên âm không thành công: Dừng chương trình
-        if segments is None: return
+        if whisper_result is None: 
+            print("Lỗi: Phiên âm thất bại.")
+            sys.exit(1)
 
-        # Hợp nhất các đoạn ngắn
-        segments = merge_short_segments(segments, max_gap_sec=1.5, min_segment_len_sec=2.0)
+        # 2. Trích xuất danh sách (LIST) segments từ DICT
+        segments_list = whisper_result.get('segments')
+        if not segments_list:
+            print("Lỗi: Whisper không tìm thấy đoạn âm thanh nào.")
+            sys.exit(1)
 
-        # Lưu tệp json
+        # 3. Truyền danh sách (LIST) vào hàm merge
+        #    Hàm này sẽ trả về một danh sách (LIST) đã được gộp
+        merged_segments_list = merge_short_segments(segments_list, max_gap_sec=1.5, min_segment_len_sec=2.0)
+        whisper_result['segments'] = merged_segments_list
+        # 5. Lưu toàn bộ DICT (đã chứa segments được gộp)
         try:
             with open(TRANSCRIPT_OUTPUT_PATH, 'w', encoding='utf-8') as f:
-                json.dump(segments, f, indent=4, ensure_ascii=False)
+                # Lưu lại toàn bộ đối tượng whisper_result
+                json.dump(whisper_result, f, indent=4, ensure_ascii=False)
+            print(f"✅ Đã lưu phiên âm (ĐÃ GỘP) vào: {TRANSCRIPT_OUTPUT_PATH}")
         except Exception as e:
             print(f"❌ LỖI: Không thể lưu tệp JSON phiên âm: {e}")
             sys.exit(1)
-        
+    else:
+        with open(TRANSCRIPT_OUTPUT_PATH, 'r', encoding='utf-8') as f:
+            segments = json.load(f)
 
-    print("Sẵn sàng cho Bước 4 (Dịch thuật)")
-        
+
+
+
+
 main()
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Thời gian Docker: {elapsed_time:.2f} giây")

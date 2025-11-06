@@ -2,21 +2,14 @@ docker build -t ai-dubbing .
 
 # 1-5
 docker run -it --rm \
-  -v "$(pwd)/main.py:/app/main.py" \
+  -v "$(pwd)/main.py:/main.py" \
   -v "$(pwd)/source:/app/source" \
   -v "$(pwd)/.cache/whisper:/root/.cache/whisper" \
   -v "$(pwd)/.cache/huggingface:/root/.cache/huggingface" \
   ai-dubbing \
   python main.py
 
-# 6
-docker run -it --rm \
-  -v "$(pwd)/main.py:/app/main.py" \
-  -v "$(pwd)/source:/app/source" \
-  -v "$(pwd)/.cache/whisper:/root/.cache/whisper" \
-  -v "$(pwd)/.cache/huggingface:/root/.cache/huggingface" \
-  ai-dubbing \
-  python main.py --step combine
 
 
-pip install torch torchaudio openai-whisper transformers sentencepiece piper-tts
+
+pip install openai-whisper transformers sentencepiece piper-tts dotenv torch torchaudio
